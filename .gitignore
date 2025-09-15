@@ -1,0 +1,8 @@
+__pycache__
+checkpoints
+Formers/
+data_provider/
+dataset/
+scripts/*/checkpoints
+scripts/*/logs
+scripts/*/*results
