@@ -48,18 +48,10 @@ class Model(nn.Module):
 
         # 1. 적응형 정규화 블록
         self.adaptive_norm_block = AdaptiveNormalizationBlock(configs)
-        self.adaptive_residual_norm_block = AdaptiveNormalizationBlock(configs)
-
-        # 2. MoE 인코더
         self.encoder = SharedEncoderWithMoE(configs)
-        self.refinement_iterations = configs.refinement_iterations
 
-        # 3a. 평균 예측을 위한 결정론적 헤드
         self.deterministic_model = PredictionHead(configs)
-        # self.deterministic_model = Decoder(configs)
-        
-        # 3b. 잔차 분포 예측을 위한 NF 기반 확률론적 헤드
-        self.residual_model = ProbabilisticResidualModel(configs) # configs를 전달하여 내부에서 초기화
+        self.residual_model = ProbabilisticResidualModel(configs) 
 
         # 손실 함수 및 잔차 정규화 통계치
         self.loss_fn_mse = nn.MSELoss()
