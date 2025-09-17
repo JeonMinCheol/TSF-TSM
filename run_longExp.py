@@ -40,7 +40,6 @@ if __name__ == '__main__':
     parser.add_argument('--label_len', type=int, default=48, help='start token length')
     parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
 
-
     # DLinear
     #parser.add_argument('--individual', action='store_true', default=False, help='DLinear: a linear layer for each variate(channel) individually')
 
@@ -51,8 +50,9 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_features', type=int, default=128)
     parser.add_argument('--num_bins', type=int, default=8)
     parser.add_argument('--alpha', type=float, default=1)
-    parser.add_argument('--training_stage', type=int, default=0, help='0: End-to-end, 1: Stage 1 (Deter only), 2: Stage 2 (Residual only)')
-    parser.add_argument('--stage1_path', type=str, default=None, help='Path to the saved checkpoint from stage 1')
+    parser.add_argument('--momentum', type=float, default=0.99)
+    parser.add_argument('--num_experts', type=int, default=6)
+    parser.add_argument('--refinement_iterations', type=int, default=4, help='Number of iterative refinement steps for the decoder')
 
     # PatchTST
     parser.add_argument('--fc_dropout', type=float, default=0.05, help='fully connected dropout')
@@ -60,7 +60,7 @@ if __name__ == '__main__':
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
     parser.add_argument('--stride', type=int, default=8, help='stride')
     parser.add_argument('--padding_patch', default='end', help='None: None; end: padding on the end')
-    parser.add_argument('--revin', type=int, default=1, help='RevIN; True 1 False 0')
+    parser.add_argument('--revin', type=int, default=0, help='RevIN; True 1 False 0')
     parser.add_argument('--affine', type=int, default=0, help='RevIN-affine; True 1 False 0')
     parser.add_argument('--subtract_last', type=int, default=0, help='0: subtract mean; 1: subtract last')
     parser.add_argument('--decomposition', type=int, default=0, help='decomposition; True 1 False 0')
@@ -100,6 +100,7 @@ if __name__ == '__main__':
     parser.add_argument('--loss', type=str, default='mse', help='loss function')
     parser.add_argument('--lradj', type=str, default='type3', help='adjust learning rate')
     parser.add_argument('--pct_start', type=float, default=0.3, help='pct_start')
+    parser.add_argument('--warmup_epochs', type=float, default=5, help='warmup epochs')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 
     # GPU

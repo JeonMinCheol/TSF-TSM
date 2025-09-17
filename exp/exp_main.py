@@ -22,7 +22,10 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 
 import logging
-logging.basicConfig(level=logging.DEBUG)
+
+from torch.utils.tensorboard import SummaryWriter
+
+from torch.profiler import profile, record_function, ProfilerActivity
 
 warnings.filterwarnings('ignore')
     
@@ -32,13 +35,17 @@ class Exp_Main(Exp_Basic):
 
     def _build_model(self):
         if self.rank == 0:
+            os.makedirs(f"/data/a2019102224/PatchTST_supervised/tensor_logs/{self.args.data}_{self.args.model}_{self.args.seq_len}_{self.args.pred_len}/", exist_ok=True)
+            self.writer = SummaryWriter(f"/data/a2019102224/PatchTST_supervised/tensor_logs/{self.args.data}_{self.args.model}_{self.args.seq_len}_{self.args.pred_len}/")
+            self.writer.add_scalar("scalar/stride", self.args.stride)
+            self.writer.add_scalar("scalar/window_size", self.args.moving_avg)
             print("Fitting scaler by iterating through the training data...")
         train_data, train_loader = self._get_data(flag='train')
         self.scaler = StandardScaler()
         
         # 1. DataLoader를 순회하며 모든 훈련 데이터를 수집합니다.
         all_train_data = []
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(tqdm(train_loader)):
+        for i, (batch_x, batch_y, _, _) in enumerate(tqdm(train_loader)):
             all_train_data.append(batch_x)
 
         # 2. 수집된 배치들을 하나의 큰 텐서로 결합합니다.
@@ -61,40 +68,7 @@ class Exp_Main(Exp_Basic):
             'TSF_TSM': TSF_TSM,
         }
         
-        if self.args.model == 'TSF_TSM':
-            model = model_dict[self.args.model].Model(self.args, self.scaler.mean_, self.scaler.scale_).float().to(self.device)
-        else:
-            model = model_dict[self.args.model].Model(self.args).float().to(self.device)
-
-        if self.args.training_stage == 2:
-            if self.rank == 0:
-                print(f"--- Loading Stage 1 model from: {self.args.stage1_path} ---")
-            
-            # DDP 환경에서는 map_location을 사용하여 각 GPU에 맞게 모델을 로드해야 합니다.
-            map_location = {'cuda:%d' % 0: 'cuda:%d' % self.rank}
-            state_dict = torch.load(self.args.stage1_path, map_location=map_location)
-            
-            # DDP로 저장된 모델은 'module.' 접두사가 붙어있을 수 있으므로 처리
-            from collections import OrderedDict
-            new_state_dict = OrderedDict()
-            for k, v in state_dict.items():
-                name = k[7:] if k.startswith('module.') else k
-                new_state_dict[name] = v
-            
-            model.load_state_dict(new_state_dict)
-
-            if self.rank == 0:
-                print("--- Freezing Deterministic Model Parameters ---")
-            
-            # 결정론적 부분의 파라미터는 학습되지 않도록 동결
-            for param in model.detrender.parameters():
-                param.requires_grad = False
-            for param in model.shared_encoder.parameters():
-                param.requires_grad = False
-            for param in model.deterministic_model.parameters():
-                param.requires_grad = False
-
-        model = model.to(self.device)
+        model = model_dict[self.args.model].Model(self.args).float().to(self.device)
 
         if self.args.use_multi_gpu and self.args.use_gpu:
             # --- DDP 초기화 ---
@@ -121,24 +95,10 @@ class Exp_Main(Exp_Basic):
 
     def _select_optimizer(self):
         if self.args.model == "TSF_TSM":
-            # 💡 [수정] 학습 단계에 따라 필요한 옵티마이저만 생성합니다.
-            if self.args.training_stage == 1:
-                # 1단계: 결정론적 부분만 학습
-                if self.rank == 0: print("Optimizer for Stage 1 (Deterministic) is created.")
-                model_optim = optim.Adam(list(self.model.module.detrender.parameters()) + 
-                                         list(self.model.module.deterministic_model.parameters()) +
-                                         list(self.model.module.shared_encoder.parameters()), # shared_encoder도 학습
-                                         lr=self.args.learning_rate)
-            elif self.args.training_stage == 2:
-                # 2단계: 확률론적 부분만 학습
-                if self.rank == 0: print("Optimizer for Stage 2 (Probabilistic) is created.")
-                model_optim = optim.Adam(self.model.module.residual_model.parameters(), lr=self.args.learning_rate)
-            else: # 0단계: End-to-end 학습
-                if self.rank == 0: print("Optimizers for End-to-End training are created.")
-                model_optim = [
-                    optim.Adam(list(self.model.module.detrender.parameters()) + list(self.model.module.deterministic_model.parameters()), lr=self.args.learning_rate),
-                    optim.Adam(self.model.module.residual_model.parameters(), lr=self.args.learning_rate)
-                ]
+            model_optim = [
+                optim.Adam(list(self.model.module.adaptive_norm_block.parameters()) + list(self.model.module.deterministic_model.parameters()), lr=self.args.learning_rate),
+                optim.Adam(self.model.module.residual_model.parameters(), lr=self.args.learning_rate)
+            ]
         else:
             model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         return model_optim
@@ -199,7 +159,9 @@ class Exp_Main(Exp_Basic):
                 loss = criterion(pred, true)
 
                 total_loss.append(loss)
+
         total_loss = np.average(total_loss)
+        
         self.model.train()
         return total_loss
 
@@ -215,7 +177,7 @@ class Exp_Main(Exp_Basic):
         time_now = time.time()
 
         train_steps = len(train_loader)
-        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
+        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True, rank=self.rank)
 
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
@@ -305,72 +267,68 @@ class Exp_Main(Exp_Basic):
                 else:
                     if self.args.use_amp:
                         with torch.cuda.amp.autocast():
+                            # 모델 forward 한 번 호출
                             deter_optim.zero_grad()
                             residual_opitm.zero_grad()
-                            
-                            # 모델 forward 한 번 호출
-                            deter_loss, nll_loss, mse_loss = self.model(batch_x, batch_y)
-                            residual_loss = nll_loss #+ 0.5 * mse_loss
-                            
-                            # 손실 기록
-                            if self.args.training_stage == 1: # 1단계
-                                total_loss = deter_loss
-                                model_optim.zero_grad()
-                                scaler.scale(total_loss).backward()
-                                scaler.step(model_optim)
-                                scaler.update()
 
-                            elif self.args.training_stage == 2: # 2단계
-                                total_loss = residual_loss
-                                model_optim.zero_grad()
-                                scaler.scale(total_loss).backward()
-                                scaler.step(model_optim)
-                                scaler.update()
+                            deter_loss, residual_loss = self.model(batch_x, batch_y)
+                            beta = min(1.0, epoch / self.args.warmup_epochs)
 
-                            else: # 0단계 (End-to-End)
-                                deter_optim, residual_opitm = model_optim
-                                deter_optim.zero_grad()
-                                residual_opitm.zero_grad()
-                                total_loss = deter_loss + self.alpha * residual_loss
-                                scaler.scale(total_loss).backward()
-                                scaler.step(deter_optim)
-                                scaler.step(residual_opitm)
-                                scaler.update()
-                                scaler.update()
+                            total_loss = (1 - self.args.alpha) * deter_loss + self.args.alpha * residual_loss
 
-                            deter_train_loss.append(deter_loss.item())
-                            residual_train_loss.append(residual_loss.item())
+                            scaler.scale(total_loss).backward()
+                            scaler.step(deter_optim)
+                            scaler.step(residual_opitm)
+                            scaler.update()
+
+                        deter_train_loss.append(deter_loss.item())
+                        residual_train_loss.append(residual_loss.item())
                     else:
+                        # if epoch == 0 and i == 5:
+                        #     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+                        #         with record_function("model_inference"): # 이 블록에 'model_inference'라는 이름을 붙임
+                        #             deter_optim.zero_grad()
+                        #             residual_opitm.zero_grad()
+
+                        #             deter_loss, residual_loss = self.model(batch_x, batch_y)
+                        #             total_loss = deter_loss + self.args.alpha * residual_loss
+
+                        #             total_loss.backward()
+                        #             deter_optim.step()
+                        #             residual_opitm.step()
+
+                        #             deter_train_loss.append(deter_loss.item())
+                        #             residual_train_loss.append(residual_loss.item())
+
+                            # if self.rank == 0:
+                            #     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
                         deter_optim.zero_grad()
                         residual_opitm.zero_grad()
 
-                        deter_loss, nll_loss, mse_loss = self.model(batch_x, batch_y)
-                        residual_loss = nll_loss #+ 0.5 * mse_loss
+                        deter_loss, residual_loss = self.model(batch_x, batch_y)
+                        total_loss = deter_loss + self.args.alpha * residual_loss
 
-                        if self.args.training_stage == 1: # 1단계
-                            total_loss = deter_loss
-                            model_optim.zero_grad()
-                            total_loss.backward()
-                            model_optim.step()
-
-                        elif self.args.training_stage == 2: # 2단계
-                            total_loss = residual_loss
-                            model_optim.zero_grad()
-                            total_loss.backward()
-                            model_optim.step()
-
-                        else: # 0단계 (End-to-End)
-                            deter_optim, residual_opitm = model_optim
-                            deter_optim.zero_grad()
-                            residual_opitm.zero_grad()
-                            total_loss = deter_loss + self.alpha * residual_loss
-                            total_loss.backward()
-                            deter_optim.step()
-                            residual_opitm.step()
+                        total_loss.backward()
+                        deter_optim.step()
+                        residual_opitm.step()
 
                         deter_train_loss.append(deter_loss.item())
                         residual_train_loss.append(residual_loss.item())
 
+                if self.rank == 0 and self.args.model == "TSF_TSM":
+                    self.writer.add_scalar("residual/mean", self.model.module.residual_mean, epoch)
+                    self.writer.add_scalar("residual/std", self.model.module.residual_std, epoch)
+
+                    self.writer.add_scalar("train/Model Optimizer LR", deter_optim.param_groups[0]['lr'], epoch)
+                    self.writer.add_scalar("train/Deterministic Loss", deter_loss, epoch)
+                    self.writer.add_scalar("train/Residual Loss", residual_loss, epoch)
+                    self.writer.add_scalar("train/Total Loss", total_loss, epoch)
+                    self.writer.flush()
+
+                elif self.rank == 0 and self.args.model != "TSF_TSM":
+                    self.writer.add_scalar("train/Model Optimizer LR", model_optim.param_groups[0]['lr'], epoch)
+                    self.writer.add_scalar("train/Total Loss", loss.item(), epoch)
+                    self.writer.flush()
 
                 if (i + 1) % 100 == 0 and self.rank == 0:
                     if self.args.model != "TSF_TSM":
@@ -383,39 +341,35 @@ class Exp_Main(Exp_Basic):
                     iter_count = 0
                     time_now = time.time()
 
-                if self.args.use_amp:
-                    if self.args.model == "TSF_TSM":
-                        scaler.scale(loss).backward()
-                        scaler.step(model_optim)
-                        scaler.update()
-                elif self.args.model != "TSF_TSM":
-                        loss.backward()
-                        model_optim.step()
-                    
                 if self.args.lradj == 'TST':
                     if self.args.model == "TSF_TSM":
                         # TSF_TSM 모델은 두 스케줄러를 모두 업데이트
                         deter_scheduler.step()
                         residual_scheduler.step()
                     else:
-                        adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
+                        adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=True, rank=self.rank)
                         scheduler.step()
-            if self.rank == 0:
+            if self.args.use_gpu and self.rank == 0 or self.args.use_gpu == False:
                 print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+
             train_loss = np.average(train_loss)
+
             if self.args.model == "TSF_TSM":
                 deter_train_loss = np.average(deter_train_loss)
                 residual_train_loss = np.average(residual_train_loss)
 
-            if self.rank == 0:
-                print("Validation start")
+            if self.args.use_gpu and self.rank == 0 or self.args.use_gpu == False: print("Validation start")
             vali_loss = self.vali(vali_data, vali_loader, criterion)
 
-            if self.rank == 0:
-                print("Test start")
+            if self.args.use_gpu and self.rank == 0 or self.args.use_gpu == False: print("Test start")
             test_loss = self.vali(test_data, test_loader, criterion)
 
             if self.rank == 0:
+                self.writer.add_scalar("vali/loss", vali_loss, epoch)
+                self.writer.add_scalar("test/loss", test_loss, epoch)
+                self.writer.flush()
+
+            if self.args.use_gpu and self.rank == 0 or self.args.use_gpu == False:
                 if self.args.model != "TSF_TSM":
                     print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                         epoch + 1, train_steps, train_loss, vali_loss, test_loss))
@@ -425,16 +379,16 @@ class Exp_Main(Exp_Basic):
 
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
-                if self.rank == 0:
+                if self.args.use_gpu and self.rank == 0 or self.args.use_gpu == False:
                     print("Early stopping")
                 break
 
             if self.args.lradj != 'TST':
                 if self.args.model == "TSF_TSM":
-                    adjust_learning_rate(deter_optim, deter_scheduler, epoch + 1, self.args)
-                    adjust_learning_rate(residual_opitm, residual_scheduler, epoch + 1, self.args)
+                    adjust_learning_rate(deter_optim, deter_scheduler, epoch + 1, self.args, True, self.rank)
+                    adjust_learning_rate(residual_opitm, residual_scheduler, epoch + 1, self.args, True, self.rank)
                 else:
-                    adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args)
+                    adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, True, self.rank)
             elif self.rank == 0:
                 if self.args.model == "TSF_TSM":
                     print('Updating Deterministic learning rate to {}'.format(deter_scheduler.get_last_lr()[0]))
@@ -451,7 +405,7 @@ class Exp_Main(Exp_Basic):
         test_data, test_loader = self._get_data(flag='test')
         
         if test:
-            if self.rank == 0:
+            if self.args.use_gpu and self.rank == 0 or self.args.use_gpu == False:
                 print('loading model')
             self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
 
@@ -515,14 +469,15 @@ class Exp_Main(Exp_Basic):
                 preds.append(pred)
                 trues.append(true)
                 inputx.append(batch_x.detach().cpu().numpy())
-                if i % 20 == 0:
+
+                if i % 20 == 0: # 숫자 변경
                     input = batch_x.detach().cpu().numpy()
                     gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
                     pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
                     visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
 
-        if self.args.test_flop:
-            test_params_flop((batch_x.shape[1],batch_x.shape[2]))
+        if self.args.test_flop and self.rank == 0:
+            test_params_flop(self.model, (batch_x.shape[1],batch_x.shape[2]))
             exit()
         preds = np.array(preds)
         trues = np.array(trues)
@@ -542,7 +497,7 @@ class Exp_Main(Exp_Basic):
         os.makedirs(folder_path, exist_ok=True)
 
         mae, mse, rmse, mape, mspe, rse, corr = metric(preds, trues)
-        if self.rank == 0:
+        if self.args.use_gpu and self.rank == 0 or self.args.use_gpu == False:
             print('mae:{}, mse:{}, rmse:{}, mape:{}, mspe:{}, rse:{}, corr:{}'.format(mae, mse, rmse, mape, mspe, rse, corr))
             f = open("result.txt", 'a')
             f.write(setting + "  \n")
@@ -555,6 +510,9 @@ class Exp_Main(Exp_Basic):
         np.save(folder_path + 'pred.npy', preds)
         # np.save(folder_path + 'true.npy', trues)
         # np.save(folder_path + 'x.npy', inputx)
+
+        if self.rank == 0:
+            self.writer.close()
         return
 
     def predict(self, setting, load=False):
