@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .TSF_TSM_layers import PatchingEmbedding
-from .SelfAttention_Family import SparseVariationalAttention, AttentionPool
+from .SelfAttention_Family import AttentionPool
 
 class MoE(nn.Module):
     """Mixture of Experts FFN 레이어."""

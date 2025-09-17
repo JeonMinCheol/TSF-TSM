@@ -9,7 +9,6 @@ import logging
 from nflows.flows.base import Flow
 from nflows.distributions.normal import StandardNormal
 from nflows.transforms.base import CompositeTransform
-from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
 from nflows.transforms.coupling import PiecewiseRationalQuadraticCouplingTransform
 from nflows.transforms.permutations import RandomPermutation
 from nflows.transforms.normalization import BatchNorm
@@ -77,30 +76,8 @@ class PatchingEmbedding(nn.Module):
         out = self.projection(x_flattened)
         
         return out
-        
-"""
-Summary context -> predicted correction sequence for residuals.
-We subtract this from residuals before feeding flow (so flow models the 'whitened' residual).
-During sampling we add this AR prediction back to the sampled residuals.
-"""
-class ResidualAR(nn.Module):
-    def __init__(self, context_dim, pred_len, enc_in, hidden=512):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(context_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden//2),
-            nn.ReLU(),
-            nn.Linear(hidden//2, pred_len * enc_in)
-        )
-    def forward(self, context):
-        # context: (B, context_dim) -> output (B, pred_len)
-        return self.net(context)
 
 
-"""
-MLP를 사용하여 데이터에서 비선형 추세를 학습하고 분리하는 모듈
-"""
 class LearnableTrend(nn.Module):
     def __init__(self, seq_len, pred_len, enc_in):
         super().__init__()
@@ -146,6 +123,7 @@ class LearnableTrend(nn.Module):
         
         return detrended_x, future_trend
 
+
 class DecoderLayer(nn.Module):
     def __init__(self, d_model, n_heads, d_ff=None, dropout=0.1):
         super().__init__()
@@ -183,24 +161,6 @@ class DecoderLayer(nn.Module):
         
         return x
 
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation 블록. 채널(피처)별 중요도를 학습합니다."""
-    def __init__(self, in_channels, reduction_ratio=16):
-        super().__init__()
-        self.squeeze = nn.AdaptiveAvgPool1d(1)
-        self.excitation = nn.Sequential(
-            nn.Linear(in_channels, in_channels // reduction_ratio, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_channels // reduction_ratio, in_channels, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        # x shape: [Batch, Channels, Seq_Len]
-        B, C, _ = x.shape
-        y = self.squeeze(x).view(B, C) # Squeeze: [B, C]
-        y = self.excitation(y).view(B, C, 1) # Excitation: [B, C, 1]
-        return x * y.expand_as(x) # Scale (Re-calibrate)
 
 class MultiScaleTrendSE(nn.Module):
     """멀티스케일 Conv1d와 SE 블록을 결합한 추세 모델."""

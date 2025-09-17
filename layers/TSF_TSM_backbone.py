@@ -1,13 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import numpy as np
-import time
-import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler
-from scipy.signal import periodogram
-from .SelfAttention_Family import SparseVariationalAttention, AttentionPool
 from .TSF_TSM_layers import *
 
 # nflows 라이브러리 임포트
@@ -38,69 +30,6 @@ class PredictionHead(nn.Module):
         output_flat = self.head(summary_context)
         # output shape: [B, pred_len, c_in]
         return output_flat.view(-1, self.pred_len, self.enc_in)
-
-class ChunkedAutoregressiveFlowHead(nn.Module):
-    def __init__(self, step_dim, context_dim, pred_len, chunk_size,
-                 flow_layers=5, hidden_features=256, num_bins=16):
-        super().__init__()
-        self.step_dim = step_dim
-        self.pred_len = pred_len
-        self.chunk_size = chunk_size
-        self.num_chunks = (pred_len + chunk_size - 1) // chunk_size
-
-        self.flows = nn.ModuleList([
-            create_conditional_nsf_flow(
-                feature_dim=step_dim * chunk_size,
-                context_dim=context_dim + step_dim * chunk_size * i,
-                num_layers=flow_layers, hidden_features=hidden_features, num_bins=num_bins
-            ) for i in range(self.num_chunks)
-        ])
-
-    def log_prob(self, inputs, context):
-        # inputs의 기대 shape: (B, pred_len, step_dim)
-        B = inputs.size(0)
-        
-        log_probs, prev_chunks_list = [], []
-        for i, flow in enumerate(self.flows):
-            flat_prev_chunks = torch.cat(prev_chunks_list, dim=-1) if prev_chunks_list else context.new_empty(B, 0)
-            ar_context = torch.cat([context, flat_prev_chunks], dim=-1)
-            
-            start, end = i * self.chunk_size, min((i + 1) * self.chunk_size, self.pred_len)
-            
-            # ✅ 슬라이싱 후 view/reshape 전에 .contiguous()를 추가하여 메모리 관련 에러를 방지합니다.
-            chunk_target = inputs[:, start:end, :].contiguous().view(B, -1)
-            
-            # 마지막 청크가 작을 경우, 크기를 맞춰주기 위한 패딩 처리
-            if chunk_target.shape[1] < self.chunk_size * self.step_dim:
-                padding = torch.zeros(B, self.chunk_size * self.step_dim - chunk_target.shape[1], device=inputs.device)
-                chunk_target = torch.cat([chunk_target, padding], dim=1)
-
-            log_probs.append(flow.log_prob(chunk_target, context=ar_context))
-            
-            # prev_chunks_list에 추가할 때도 동일하게 처리하여 일관성을 유지합니다.
-            prev_chunks_list.append(chunk_target) # 이미 reshape 및 padding된 chunk_target을 사용
-
-        return torch.stack(log_probs, dim=1).sum(dim=1)
-
-    def sample(self, num_samples, context):
-        B = context.size(0)
-        all_samples, prev_chunks_list = [], []
-        expanded_context = context.unsqueeze(0).expand(num_samples, B, -1).reshape(num_samples * B, -1)
-
-        for i, flow in enumerate(self.flows):
-            flat_prev_chunks = torch.cat(prev_chunks_list, dim=-1) if prev_chunks_list else expanded_context.new_empty(num_samples*B, 0)
-            ar_context = torch.cat([expanded_context, flat_prev_chunks], dim=-1)
-            
-            # nflows의 sample 메서드는 contiguous 관련 문제가 거의 없지만, 일관성을 위해 그대로 둡니다.
-            chunk_sample_flat = flow.sample(1, context=ar_context).squeeze(1)
-            all_samples.append(chunk_sample_flat)
-            prev_chunks_list.append(chunk_sample_flat)
-
-        samples_padded = torch.cat(all_samples, dim=-1)
-        # 패딩된 부분을 제거하고 원래 길이에 맞게 자릅니다.
-        samples = samples_padded[:, :self.pred_len * self.step_dim]
-        # 최종적으로 (num_samples, B, pred_len, step_dim) 형태로 복원합니다.
-        return samples.view(num_samples, B, self.pred_len, self.step_dim)
 
 class ProbabilisticResidualModel(nn.Module):
     def __init__(self, configs):
@@ -186,37 +115,3 @@ class ProbabilisticResidualModel(nn.Module):
             final_samples = final_samples / counts.unsqueeze(0)
 
         return final_samples
-
-class Decoder(nn.Module):
-    def __init__(self, configs):
-        super().__init__()
-        
-        # 디코더의 입력(타겟 시퀀스)을 d_model 차원으로 변환하는 임베딩 레이어
-        self.embedding = nn.Linear(configs.enc_in, configs.d_model)
-        
-        # DecoderLayer를 num_layers 만큼 쌓음
-        self.layers = nn.ModuleList([
-            DecoderLayer(configs.d_model, configs.n_heads, configs.d_ff, configs.dropout) for _ in range(configs.num_layers)
-        ])
-        
-        # 최종 출력을 원래 피처 차원(c_in)으로 변환하는 프로젝션 레이어
-        self.projection = nn.Linear(configs.d_model, configs.enc_in)
-
-    def forward(self, x, memory):
-        # x: 디코더의 입력. shape: [Batch, Target_Seq_Len, c_in]
-        # memory: 인코더의 전체 출력. shape: [Batch, Source_Seq_Len, d_model]
-        
-        # 1. 입력 임베딩
-        x = self.embedding(x)
-        
-        # 2. Self-Attention을 위한 Look-ahead 마스크 생성
-        #    디코더가 예측 시점 t에서, t보다 미래의 정보를 보지 못하게 함
-        seq_len = x.size(1)
-        tgt_mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device) * float('-inf'), diagonal=1)
-
-        # 3. 모든 디코더 레이어를 순차적으로 통과
-        for layer in self.layers:
-            x = layer(x, memory, tgt_mask=tgt_mask)
-            
-        # 4. 최종 출력
-        return self.projection(x)
