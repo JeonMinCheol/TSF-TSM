@@ -23,13 +23,15 @@ class PredictionHead(nn.Module):
         super().__init__()
         self.pred_len = configs.pred_len
         self.enc_in = configs.enc_in
-        self.head = nn.Linear(configs.d_model, configs.pred_len * configs.enc_in)
+        self.fc1 = nn.Linear(configs.d_model, configs.pred_len * configs.enc_in * 4)
+        self.fc2 = nn.Linear(configs.pred_len * configs.enc_in * 4, configs.pred_len * configs.enc_in * 2)
+        self.head = nn.Linear(configs.pred_len * configs.enc_in * 2, configs.pred_len * configs.enc_in)
 
     def forward(self, summary_context):
-        # summary_context shape: [B, d_model]
-        output_flat = self.head(summary_context)
-        # output shape: [B, pred_len, c_in]
-        return output_flat.view(-1, self.pred_len, self.enc_in)
+        x = self.fc1(summary_context)
+        x = self.fc2(x)
+        output = self.head(x).view(-1, self.pred_len, self.enc_in)
+        return output
 
 class ProbabilisticResidualModel(nn.Module):
     def __init__(self, configs):

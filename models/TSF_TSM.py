@@ -1,25 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 import numpy as np
-import time
-import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler
-from scipy.signal import periodogram
 import os, sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# nflows 라이브러리 임포트
-from nflows.flows.base import Flow
-from nflows.distributions.normal import StandardNormal
-from nflows.transforms.base import CompositeTransform
-from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
-from nflows.transforms.coupling import PiecewiseRationalQuadraticCouplingTransform
-from nflows.transforms.permutations import RandomPermutation
-from nflows.transforms.normalization import BatchNorm
-from nflows.nn.nets import ResidualNet
 
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
@@ -46,11 +30,10 @@ class Model(nn.Module):
         self.c_in = configs.enc_in
         self.d_model = configs.d_model
 
-        # 1. 적응형 정규화 블록
         self.adaptive_norm_block = AdaptiveNormalizationBlock(configs)
         self.encoder = SharedEncoderWithMoE(configs)
-
-        self.deterministic_model = PredictionHead(configs)
+        
+        self.st_model = PredictionHead(configs)
         self.residual_model = ProbabilisticResidualModel(configs) 
 
         # 손실 함수 및 잔차 정규화 통계치
@@ -70,11 +53,11 @@ class Model(nn.Module):
         summary_context = self.encoder(normalized_x)
 
         # 3. 결정론적 헤드를 통한 평균 예측
-        mean_pred_norm = self.deterministic_model(summary_context)
+        mean_pred_norm = self.st_model(summary_context)
         
         # --- 손실 계산을 위한 정답(y) 데이터 전처리 ---
         y_true = batch_y[:, -self.pred_len:, :]
-        y_detrended, norm_context = self.adaptive_norm_block.detrender_context_generator(y_true)
+        y_detrended, _ = self.adaptive_norm_block.detrender_context_generator(y_true)
         y_true_normalized = (y_detrended - shift) / scale
 
         # --- 안정화된 잔차 학습 (Stabilized Residual Learning) ---
@@ -108,7 +91,7 @@ class Model(nn.Module):
         summary_context = self.encoder(normalized_x)
         
         # 2. 평균 예측
-        mean_pred_norm = self.deterministic_model(summary_context)
+        mean_pred_norm = self.st_model(summary_context)
         
         # 3. NF 모델로 잔차 샘플링
         residual_samples_scaled = self.residual_model.sample(summary_context, num_samples=1).squeeze(0)
