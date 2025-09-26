@@ -4,6 +4,7 @@ import torch
 from exp.exp_main import Exp_Main
 import random
 import numpy as np
+from utils.str2bool import str2bool
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -45,14 +46,12 @@ if __name__ == '__main__':
 
     # TSF-TSM
     parser.add_argument('--eval_samples', type=int, default=2)
-    parser.add_argument('--chunk_size', type=int, default=1)
     parser.add_argument('--flow_layers', type=int, default=3)
     parser.add_argument('--hidden_features', type=int, default=128)
     parser.add_argument('--num_bins', type=int, default=8)
     parser.add_argument('--alpha', type=float, default=1)
     parser.add_argument('--momentum', type=float, default=0.99)
     parser.add_argument('--num_experts', type=int, default=6)
-    parser.add_argument('--refinement_iterations', type=int, default=4, help='Number of iterative refinement steps for the decoder')
 
     # PatchTST
     parser.add_argument('--fc_dropout', type=float, default=0.05, help='fully connected dropout')
@@ -88,6 +87,36 @@ if __name__ == '__main__':
     parser.add_argument('--activation', type=str, default='gelu', help='activation')
     parser.add_argument('--output_attention', action='store_true', help='whether to output attention in ecoder')
     parser.add_argument('--do_predict', action='store_true', help='whether to predict unseen future data')
+
+    # iTransformer
+    parser.add_argument('--exp_name', type=str, required=False, default='MTSF',
+                        help='experiemnt name, options:[MTSF, partial_train]')
+    parser.add_argument('--channel_independence', type=bool, default=False, help='whether to use channel_independence mechanism')
+    parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
+    parser.add_argument('--class_strategy', type=str, default='projection', help='projection/average/cls_token')
+    parser.add_argument('--target_root_path', type=str, default='./data/electricity/', help='root path of the data file')
+    parser.add_argument('--target_data_path', type=str, default='electricity.csv', help='data file')
+    parser.add_argument('--efficient_training', type=bool, default=False, help='whether to use efficient_training (exp_name should be partial train)') # See Figure 8 of our paper for the detail
+    parser.add_argument('--use_norm', type=int, default=True, help='use norm and denorm')
+    parser.add_argument('--partial_start_index', type=int, default=0, help='the start index of variates for partial training, '
+                                                                           'you can select [partial_start_index, min(enc_in + partial_start_index, N)]')
+
+    #ModernTCN
+    parser.add_argument('--stem_ratio', type=int, default=6, help='stem ratio')
+    parser.add_argument('--downsample_ratio', type=int, default=2, help='downsample_ratio')
+    parser.add_argument('--ffn_ratio', type=int, default=2, help='ffn_ratio')
+    parser.add_argument('--patch_size', type=int, default=16, help='the patch size')
+    parser.add_argument('--patch_stride', type=int, default=8, help='the patch stride')
+
+    parser.add_argument('--num_blocks', nargs='+',type=int, default=[1,1,1,1], help='num_blocks in each stage')
+    parser.add_argument('--large_size', nargs='+',type=int, default=[31,29,27,13], help='big kernel size')
+    parser.add_argument('--small_size', nargs='+',type=int, default=[5,5,5,5], help='small kernel size for structral reparam')
+    parser.add_argument('--dims', nargs='+',type=int, default=[256,256,256,256], help='dmodels in each stage')
+    parser.add_argument('--dw_dims', nargs='+',type=int, default=[256,256,256,256])
+
+    parser.add_argument('--small_kernel_merged', type=str2bool, default=False, help='small_kernel has already merged or not')
+    parser.add_argument('--call_structural_reparam', type=bool, default=False, help='structural_reparam after training')
+    parser.add_argument('--use_multi_scale', type=str2bool, default=True, help='use_multi_scale fusion')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')

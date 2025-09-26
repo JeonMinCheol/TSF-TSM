@@ -9,7 +9,7 @@ class SEBlock(nn.Module):
         self.squeeze = nn.AdaptiveAvgPool1d(1)
         self.excitation = nn.Sequential(
             nn.Linear(in_channels, in_channels // reduction_ratio, bias=False),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Linear(in_channels // reduction_ratio, in_channels, bias=False),
             nn.Sigmoid()
         )
@@ -49,44 +49,30 @@ class MultiScaleTrendSE(nn.Module):
         recalibrated_trends = recalibrated_trends.permute(0, 2, 1)
         final_trend = self.projection(recalibrated_trends)
         detrended_x = x - final_trend
-        return detrended_x, norm_context
-
-class NormalizationHead(nn.Module):
-    """컨텍스트를 기반으로 정규화 파라미터(scale, shift)를 예측하는 헤드."""
-    def __init__(self, d_model, c_in):
-        super().__init__()
-        self.scale_head = nn.Linear(d_model, c_in)
-        self.shift_head = nn.Linear(d_model, c_in)
-
-    def forward(self, context):
-        # context shape: [B, d_model]
-        # Softplus를 통해 scale이 항상 양수가 되도록 보장
-        scale = F.softplus(self.scale_head(context)) + 1e-6 # [B, c_in]
-        shift = self.shift_head(context) # [B, c_in]
-        return scale, shift
+        return detrended_x, final_trend, norm_context
 
 class AdaptiveNormalizationBlock(nn.Module):
     """Detrender와 NormalizationHead를 결합한 적응형 정규화 블록."""
     def __init__(self, configs):
         super().__init__()
         self.detrender_context_generator = MultiScaleTrendSE(configs.enc_in, configs.seq_len, configs.pred_len, configs.d_model)
-        self.normalization_head = NormalizationHead(configs.d_model, configs.enc_in)
 
     def normalize(self, x):
         # x shape: [B, L, C]
         # context shape: [B, d_model]
-        detrended_x, norm_context = self.detrender_context_generator(x)
-        scale, shift = self.normalization_head(norm_context)
+        detrended_x, trend, _ = self.detrender_context_generator(x)
+        means = detrended_x.mean(dim=[0, 1], keepdim=True).detach()
+        stdev = torch.sqrt(torch.var(detrended_x, dim=[0, 1], keepdim=True, unbiased=False) + 1e-5)
+        normalized_x = (detrended_x - means) / stdev
 
-        # 정규화를 위해 scale/shift를 [B, 1, C]로 차원 확장
-        scale = scale.unsqueeze(1)
-        shift = shift.unsqueeze(1)
+        # 역정규화를 위해 필요한 모든 값을 반환
+        return normalized_x, means, stdev, trend
+
+    def denormalize(self, y_norm, means, stdev, trend):
+        # 1. Instance Normalization을 되돌림
+        y_detrended = y_norm * stdev + means
         
-        normalized_x = (detrended_x - shift) / scale
-        return normalized_x, scale, shift
-
-    def denormalize(self, y, scale, shift):
-        # y shape: [B, L_pred, C]
-        # scale/shift shape: [B, 1, C]
-        denormalized_y = y * scale + shift
-        return denormalized_y
+        # 2. 제거했던 트렌드를 다시 더함
+        final_y = y_detrended + trend
+        
+        return final_y

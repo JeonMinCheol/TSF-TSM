@@ -1,36 +1,35 @@
 import torch
 import torch.nn as nn
 from .TSF_TSM_layers import *
-
-# nflows 라이브러리 임포트
-from nflows.flows.base import Flow
-from nflows.distributions.normal import StandardNormal
-from nflows.transforms.base import CompositeTransform
-from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
-from nflows.transforms.coupling import PiecewiseRationalQuadraticCouplingTransform
-from nflows.transforms.permutations import RandomPermutation
-from nflows.transforms.normalization import BatchNorm
-from nflows.nn.nets import ResidualNet
-
+from .TSF_TSM_experts_blocks import APGELU
 import logging
 
-class PredictionHead(nn.Module):
+class MeanPredictionHead(nn.Module):
     """
-    인코더가 만든 요약 컨텍스트 벡터를 받아, 
-    미래 예측 시퀀스를 한 번에 출력하는 간단한 선형 헤드.
+    메모리 효율적인 MLP 기반의 결정론적 예측 헤드.
     """
     def __init__(self, configs):
         super().__init__()
         self.pred_len = configs.pred_len
         self.enc_in = configs.enc_in
-        self.fc1 = nn.Linear(configs.d_model, configs.pred_len * configs.enc_in * 4)
-        self.fc2 = nn.Linear(configs.pred_len * configs.enc_in * 4, configs.pred_len * configs.enc_in * 2)
-        self.head = nn.Linear(configs.pred_len * configs.enc_in * 2, configs.pred_len * configs.enc_in)
+        d_model = configs.d_model
+        
+        # 중간 hidden 레이어의 차원을 설정합니다. d_model의 2배~4배 정도가 일반적입니다.
+        hidden_dim = d_model * 4
+
+        self.head = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            APGELU(hidden_dim),
+            nn.Dropout(configs.dropout),
+            nn.Linear(hidden_dim, self.pred_len * self.enc_in) # 최종 출력
+        )
 
     def forward(self, summary_context):
-        x = self.fc1(summary_context)
-        x = self.fc2(x)
-        output = self.head(x).view(-1, self.pred_len, self.enc_in)
+        # summary_context shape: [B, d_model]
+        output = self.head(summary_context) # [B, pred_len * enc_in]
+        
+        # 최종 shape으로 재구성: [B, pred_len, enc_in]
+        output = output.view(-1, self.pred_len, self.enc_in)
         return output
 
 class ProbabilisticResidualModel(nn.Module):

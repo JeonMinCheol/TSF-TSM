@@ -10,7 +10,7 @@ from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from layers.TSF_TSM_backbone import *
 from layers.TSF_TSM_layers import *
 from layers.TSF_TSM_adaptive_blocks import AdaptiveNormalizationBlock
-from layers.TSF_TSM_experts_blocks import SharedEncoderWithMoE
+from layers.TSF_TSM_experts_blocks import ContextEncoder
 
 torch.manual_seed(42)
 np.random.seed(42)
@@ -31,10 +31,9 @@ class Model(nn.Module):
         self.d_model = configs.d_model
 
         self.adaptive_norm_block = AdaptiveNormalizationBlock(configs)
-        self.encoder = SharedEncoderWithMoE(configs)
-        
-        self.st_model = PredictionHead(configs)
-        self.residual_model = ProbabilisticResidualModel(configs) 
+        self.encoder = ContextEncoder(configs)
+        self.mean_head = MeanPredictionHead(configs)
+        self.residual_head = ProbabilisticResidualModel(configs) 
 
         # 손실 함수 및 잔차 정규화 통계치
         self.loss_fn_mse = nn.MSELoss()
@@ -46,23 +45,22 @@ class Model(nn.Module):
         self.momentum = configs.momentum
 
     def forward(self, x_enc, batch_y):
+        y_true = batch_y[:, -self.pred_len:, :]
+
         # 1. 적응형 정규화
-        normalized_x, scale, shift = self.adaptive_norm_block.normalize(x_enc)
+        normalized_x, means, stdev, trend = self.adaptive_norm_block.normalize(x_enc)
+        y_true_detrended = y_true - trend
+        normalized_y_true = (y_true_detrended - means) / stdev
         
         # 2. MoE 인코더를 통한 최종 특징 추출
         summary_context = self.encoder(normalized_x)
 
         # 3. 결정론적 헤드를 통한 평균 예측
-        mean_pred_norm = self.st_model(summary_context)
+        mean_pred_norm = self.mean_head(summary_context)
         
-        # --- 손실 계산을 위한 정답(y) 데이터 전처리 ---
-        y_true = batch_y[:, -self.pred_len:, :]
-        y_detrended, _ = self.adaptive_norm_block.detrender_context_generator(y_true)
-        y_true_normalized = (y_detrended - shift) / scale
-
         # --- 안정화된 잔차 학습 (Stabilized Residual Learning) ---
         # A. 정규화된 공간에서의 실제 잔차 계산
-        residuals_norm = y_true_normalized - mean_pred_norm.detach()
+        residuals_norm = normalized_y_true - mean_pred_norm.detach()
 
         if self.training:
             # 현재 배치의 잔차 통계치 계산
@@ -76,8 +74,8 @@ class Model(nn.Module):
         clipped_residuals = torch.clamp(scaled_residuals, min=-6.0, max=6.0) # 클리핑 범위를 약간 넓게 설정
         
         # D. 정규화된 잔차를 Normalizing Flow로 학습
-        log_prob = self.residual_model(summary_context, y=clipped_residuals)
-        deter_loss = self.loss_fn_mse(mean_pred_norm, y_true_normalized)
+        log_prob = self.residual_head(summary_context, y=clipped_residuals)
+        deter_loss = self.loss_fn_mse(mean_pred_norm, normalized_y_true)
         nll_loss = -log_prob.mean()
 
         # 학습에 필요한 값들을 반환
@@ -87,14 +85,14 @@ class Model(nn.Module):
         # --- 추론(Inference) 과정 ---
         
         # 1. 정규화 및 최종 컨텍스트 생성
-        normalized_x, scale, shift = self.adaptive_norm_block.normalize(x_enc)
+        normalized_x, means, stdev, trend = self.adaptive_norm_block.normalize(x_enc)
         summary_context = self.encoder(normalized_x)
         
         # 2. 평균 예측
-        mean_pred_norm = self.st_model(summary_context)
+        mean_pred_norm = self.mean_head(summary_context)
         
         # 3. NF 모델로 잔차 샘플링
-        residual_samples_scaled = self.residual_model.sample(summary_context, num_samples=1).squeeze(0)
+        residual_samples_scaled = self.residual_head.sample(summary_context, num_samples=1).squeeze(0)
         
         # 4. 샘플링된 잔차를 원래 잔차 스케일로 복원
         residual_samples_norm = (residual_samples_scaled * self.residual_std) + self.residual_mean
@@ -103,6 +101,6 @@ class Model(nn.Module):
         final_pred_norm = mean_pred_norm + residual_samples_norm
         
         # 6. 전체 스케일 복원 (De-normalization)
-        final_forecast = self.adaptive_norm_block.denormalize(final_pred_norm, scale, shift)
+        final_forecast = self.adaptive_norm_block.denormalize(final_pred_norm, means, stdev, trend)
         
         return final_forecast

@@ -29,7 +29,7 @@ def create_conditional_nsf_flow(feature_dim, context_dim, num_layers=5, hidden_f
                     hidden_features=hidden_features,
                     context_features=context_dim,
                     num_blocks=2,
-                    activation=F.relu,
+                    activation=F.leaky_relu,
                 ),
                 num_bins=num_bins, tails="linear", tail_bound=5.0
             )
@@ -47,30 +47,30 @@ class PatchingEmbedding(nn.Module):
         super().__init__()
         self.patch_len = patch_len
         self.stride = stride
-        
-        # 각 패치를 d_model 차원의 벡터로 변환할 Linear 레이어
-        # 패치는 (patch_len * c_in) 크기의 1D 벡터로 펼쳐집니다.
-        self.projection = nn.Linear(patch_len * c_in, d_model)
+        # 💡 각 변수(c_in)를 d_model로 독립적으로 투영합니다.
+        self.projection = nn.Linear(patch_len, d_model)
+        self.layer_norm = nn.LayerNorm(d_model) # 안정성을 위해 추가
+        # 💡 d_model * c_in 차원을 최종 d_model로 다시 투영할 레이어
+        self.final_projection = nn.Linear(d_model * c_in, d_model)
 
     def forward(self, x):
-        # x shape: [Batch, Seq_Len, Features]
-        # 예: [512, 336, 7]
-        
-        # 1. 시퀀스를 패치 단위로 자릅니다. (stride 만큼 겹치면서)
-        # unfold: 텐서를 슬라이딩 윈도우 방식으로 잘라주는 매우 효율적인 함수
-        # (B, L, C) -> (B, C, L) -> unfold -> (B, C, Num_Patches, Patch_Len)
+        # x shape: [B, L, C] (C = c_in)
+        B, L, C = x.shape
+
+        # 1. 패치 생성
         x_unfolded = x.permute(0, 2, 1).unfold(dimension=-1, size=self.patch_len, step=self.stride)
-        
-        # 2. 패치를 펼치기(flatten) 위해 차원을 재정렬하고 합칩니다.
-        # (B, C, Num_Patches, Patch_Len) -> (B, Num_Patches, C, Patch_Len)
-        x_patched = x_unfolded.permute(0, 2, 1, 3)
-        
-        # (B, Num_Patches, C, Patch_Len) -> (B, Num_Patches, C * Patch_Len)
+        x_patched = x_unfolded.permute(0, 2, 1, 3) # [B, Num_Patches, C, Patch_Len]
         B, n_patches, C, P = x_patched.shape
-        x_flattened = x_patched.reshape(B, n_patches, -1)
-        
-        # 3. Linear 레이어를 통과시켜 각 패치를 d_model 차원의 벡터로 임베딩
-        # (B, Num_Patches, C * Patch_Len) -> (B, Num_Patches, d_model)
-        out = self.projection(x_flattened)
-        
+
+        # 2. 💡 각 변수별로 독립적인 임베딩 수행
+        # [B, n_patches, C, P] -> [B * n_patches * C, P]
+        x_patched_flat = x_patched.reshape(-1, P)
+        projected = self.projection(x_patched_flat) # [B * n_patches * C, d_model]
+
+        # 3. 💡 변수들의 임베딩을 합치고 최종 차원으로 투영
+        projected = projected.reshape(B, n_patches, C, -1) # [B, n_patches, C, d_model]
+        projected_flat = projected.reshape(B, n_patches, -1) # [B, n_patches, C * d_model]
+
+        out = self.final_projection(projected_flat) # [B, n_patches, d_model]
+
         return out

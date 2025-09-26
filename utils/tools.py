@@ -1,8 +1,9 @@
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-import time
+import matplotlib.ticker as mticker
 import csv, os
+import seaborn as sns
 
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
@@ -43,11 +44,12 @@ def adjust_learning_rate(optimizer, scheduler, epoch, args, printout=True):
         lr = lr_adjust[epoch]
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-        if printout: print('Updating learning rate to {}'.format(lr))
+        
+        print('Updating learning rate to {}'.format(lr))
 
 
 class EarlyStopping:
-    def __init__(self, patience=7, verbose=False, delta=0):
+    def __init__(self, patience=7, verbose=False, delta=0, rank=0):
         self.patience = patience
         self.verbose = verbose
         self.counter = 0
@@ -63,7 +65,6 @@ class EarlyStopping:
             self.save_checkpoint(val_loss, model, path)
         elif score < self.best_score + self.delta:
             self.counter += 1
-            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
@@ -74,6 +75,8 @@ class EarlyStopping:
     def save_checkpoint(self, val_loss, model, path):
         if self.verbose:
             print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
+        
+        os.makedirs(path, exist_ok=True)
         torch.save(model.state_dict(), path + '/' + 'checkpoint.pth')
         self.val_loss_min = val_loss
 
@@ -97,78 +100,31 @@ class StandardScaler():
         return (data * self.std) + self.mean
 
 
-def visual(true, preds=None, name='./pic/test.pdf'):
-    """
-    Results visualization
-    """
-    plt.figure()
-    plt.plot(true, label='GroundTruth', linewidth=2)
+def visual(true, preds=None, name='./pic/test.pdf',
+           title="Forecast vs Ground Truth",
+           xlabel="Time", ylabel="Value"):
+    
+    plt.figure(figsize=(10, 4))                       
+    plt.plot(true, label='Ground Truth',
+             color="#1e7cc0", linewidth=1.4, alpha=0.9)
     if preds is not None:
-        plt.plot(preds, label='Prediction', linewidth=2)
-    plt.legend()
-    plt.savefig(name, bbox_inches='tight')
+        plt.plot(preds, label='Prediction',
+                 color="#ff0000", linewidth=1.0, alpha=0.7)
 
-# 내 모델 전용
-def predict_and_visualize(deterministic_model, residual_model, detrender, scaler, x_test_raw, y_true_raw, seq_len, pred_len, title, num_samples=50, output_path="../pic/model_prediction_final_corrected.png"):
-        """
-        주어진 모델과 데이터로 예측을 수행하고 결과를 시각화합니다.
+    # plt.title(title, fontsize=14, weight='bold', pad=12)
+    plt.xlabel(xlabel, fontsize=12)
+    plt.ylabel(ylabel, fontsize=12)
 
-        Args:
-            deterministic_model (nn.Module): 결정론적 예측 모델.
-            residual_model (nn.Module): 확률론적 잔차 모델.
-            detrender (nn.Module): 추세 제거/재결합 모듈.
-            scaler (StandardScaler): 데이터 스케일러.
-            x_test_raw (torch.Tensor): 원본 테스트 입력 데이터 (1, seq_len).
-            y_true_raw (torch.Tensor): 원본 실제 미래 값 (pred_len,).
-            seq_len (int): 입력 시퀀스 길이.
-            pred_len (int): 예측 시퀀스 길이.
-            num_samples (int): 잔차 샘플링 횟수.
-            output_path (str): 결과 그래프를 저장할 경로.
-        """
-        deterministic_model.eval()
-        residual_model.eval()
-        
-        # 올바른 순서로 전처리 적용
-        x_test_detrended, future_trend = detrender(x_test_raw)
-        x_test_scaled_np = scaler.transform(x_test_detrended.detach().numpy().reshape(-1, 1)).reshape(x_test_detrended.shape)
-        x_test_scaled = torch.tensor(x_test_scaled_np, dtype=torch.float32)
+    # 눈금/격자 가독성
+    plt.grid(True, linestyle='--', linewidth=0.6, alpha=0.7)
+    plt.xticks(fontsize=10)
+    plt.yticks(fontsize=10)
+    plt.gca().xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
 
-        with torch.no_grad():
-            # 모델 예측 (스케일링된 공간에서)
-            mean_pred_scaled = deterministic_model(x_test_scaled)
-            residual_samples_scaled1 = residual_model.sample(x_test_scaled, num_samples=1).squeeze(1)
-            residual_samples_scaled2 = residual_model.sample(x_test_scaled, num_samples=num_samples).squeeze(1)
-            
-            # 스케일 복원
-            final_samples_scaled1 = mean_pred_scaled.unsqueeze(0) + residual_samples_scaled1
-            final_samples_scaled2 = mean_pred_scaled.unsqueeze(0) + residual_samples_scaled2
-            final_samples_detrended_np1 = scaler.inverse_transform(final_samples_scaled1.detach().numpy().reshape(-1, 1)).reshape(1, pred_len)
-            final_samples_detrended_np2 = scaler.inverse_transform(final_samples_scaled2.detach().numpy().reshape(-1, 1)).reshape(num_samples, pred_len)
-            final_samples_detrended1 = torch.tensor(final_samples_detrended_np1, dtype=torch.float32)
-            final_samples_detrended2 = torch.tensor(final_samples_detrended_np2, dtype=torch.float32)
-
-            # 추세 재결합
-            final_samples_raw1 = final_samples_detrended1 + future_trend
-            final_samples_raw2 = final_samples_detrended2 + future_trend
-
-        # 예측 결과 통계 계산
-        mu_pred = final_samples_raw1.mean(dim=0)
-        lower_bound = final_samples_raw2.kthvalue(int(0.05 * num_samples), dim=0).values
-        upper_bound = final_samples_raw2.kthvalue(int(0.95 * num_samples), dim=0).values
-        
-        # 시각화
-        plt.figure(figsize=(14, 7))
-        plt.plot(range(seq_len), x_test_raw.flatten().detach().numpy(), label="Input Data", color='black')
-        future_range = range(seq_len, seq_len + pred_len)
-        plt.plot(future_range, y_true_raw.detach().numpy(), 'o-', label="Actual Future", color='green', markersize=3)
-        plt.plot(future_range, mu_pred.detach().numpy(), 'o-', label="Predicted Mean", color='red', markersize=3)
-        plt.fill_between(future_range, lower_bound.numpy(), upper_bound.numpy(), color='red', alpha=0.2, label="90% Confidence Interval")
-        plt.title(title, fontsize=16)
-        plt.xlabel("Time Step")
-        plt.ylabel("Value")
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.6)
-        plt.savefig(output_path)
+    plt.legend(fontsize=11, loc='best', frameon=True)
+    plt.tight_layout()
+    plt.savefig(name, bbox_inches='tight', dpi=300)
+    plt.close()
 
 def test_params_flop(model,x_shape):
     """
@@ -178,13 +134,14 @@ def test_params_flop(model,x_shape):
     for parameter in model.parameters():
         model_params += parameter.numel()
         print('INFO: Trainable parameter count: {:.2f}M'.format(model_params / 1000000.0))
-    from ptflops import get_model_complexity_info    
-    with torch.cuda.device(0):
-        macs, params = get_model_complexity_info(model.cuda(), x_shape, as_strings=True, print_per_layer_stat=True)
-        # print('Flops:' + flops)
-        # print('Params:' + params)
-        print('{:<30}  {:<8}'.format('Computational complexity: ', macs))
-        print('{:<30}  {:<8}'.format('Number of parameters: ', params))
+    
+    # from ptflops import get_model_complexity_info    
+    # with torch.cuda.device(0):
+    #     macs, params = get_model_complexity_info(model.cuda(), x_shape, as_strings=True, print_per_layer_stat=True)
+    #     print('Flops:' + flops)
+    #     print('Params:' + params)
+    #     print('{:<30}  {:<8}'.format('Computational complexity: ', macs))
+    #     print('{:<30}  {:<8}'.format('Number of parameters: ', params))
 
     # get_model_complexity_info:  네트워크의 연산량과 패러미터 수를 출력
         # model: nn.Modules 클래스로 만들어진 객체. 연산량과 패러미터 수를 측정할 네트워크입니다.
@@ -192,6 +149,7 @@ def test_params_flop(model,x_shape):
         # print_per_layer_stat: True일 시, Layer 단위로 연산량과 패러미터 수를 출력합니다.
         # as_strings: True일 시, 연산량 및 패러미터 수를 string으로 변환하여 출력합니다.
         # verbose: True일 시, zero-op에 대한 warning을 출력합니다.
+
 
 class SimpleLogger:
     def __init__(self, log_dir="logs", filename="train_log.csv"):
@@ -223,3 +181,73 @@ class SimpleLogger:
                              kwargs.get("grad_norm", ""),
                              kwargs.get("lr", ""),
                              kwargs.get("time","")])
+
+
+
+def plot_attention_heatmap(attention_weights, layer_num, head_num, title, sample_num=0):
+    """
+    주어진 어텐션 가중치로 히트맵을 그리는 함수.
+
+    Args:
+        attention_weights (torch.Tensor): 어텐션 가중치 텐서. Shape: [B, n_heads, L, L]
+        layer_num (int): 시각화할 레이어 번호.
+        head_num (int): 시각화할 헤드 번호.
+        sample_num (int): 시각화할 배치의 샘플 번호.
+    """
+    # 시각화할 특정 샘플, 특정 헤드의 어텐션 맵 선택
+    # CPU로 데이터 이동 및 numpy 배열로 변환
+    attn_map = attention_weights[sample_num, head_num].detach().cpu().numpy()
+
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(attn_map, cmap='viridis') # 'viridis', 'plasma' 등 다양한 색상 맵 사용 가능
+    
+    plt.title(f'Attention Heatmap (Layer {layer_num+1}, Head {head_num+1})')
+    plt.xlabel('Key (Attended Patches)')
+    plt.ylabel('Query (Current Patches)')
+    plt.savefig()
+
+
+import io
+from PIL import Image
+import numpy as np
+
+def get_heatmap_image_tensor(attention_weights, sample_num=0, head_num=0):
+    """
+    어텐션 가중치로 히트맵을 그려 PyTorch 이미지 텐서로 반환하는 함수.
+    
+    Args:
+        attention_weights (torch.Tensor): 어텐션 가중치. Shape: [B, n_heads, L, L]
+        sample_num (int): 시각화할 배치의 샘플 번호.
+        head_num (int): 시각화할 헤드 번호.
+
+    Returns:
+        torch.Tensor: 이미지 텐서. Shape: [C, H, W]
+    """
+    # 특정 어텐션 맵 선택
+    attn_map = attention_weights[sample_num, head_num].detach().cpu().numpy()
+
+    # Matplotlib Figure 생성
+    fig, ax = plt.subplots(figsize=(10, 8))
+    sns.heatmap(attn_map, cmap='viridis', ax=ax, cbar=False) # cbar는 생략 가능
+    ax.set_title(f'Attention Heatmap (Head {head_num+1})')
+    ax.set_xlabel('Key Patches')
+    ax.set_ylabel('Query Patches')
+    fig.tight_layout()
+
+    # 💡 Figure를 메모리 버퍼에 PNG 이미지로 저장
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png')
+    buf.seek(0)
+
+    # 💡 버퍼의 이미지를 PIL로 열고 Numpy 배열로 변환
+    img = Image.open(buf)
+    img_array = np.array(img.convert('RGB'))
+
+    # 💡 Numpy 배열을 PyTorch 텐서로 변환하고, 채널 순서 변경 [H, W, C] -> [C, H, W]
+    img_tensor = torch.from_numpy(img_array).permute(2, 0, 1)
+
+    # 메모리 누수 방지를 위해 figure와 buffer를 닫음
+    plt.close(fig)
+    buf.close()
+
+    return img_tensor
