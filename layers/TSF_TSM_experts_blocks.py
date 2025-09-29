@@ -196,7 +196,7 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_model, d_ff),
-                APGELU(d_model),
+                APGELU(d_ff),
                 nn.Linear(d_ff, d_model)
             ) for _ in range(num_experts)
         ])
