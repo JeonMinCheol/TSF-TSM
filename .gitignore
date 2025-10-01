@@ -1,6 +1,4 @@
 __pycache__
 checkpoints
 Formers/
-data_provider/
-dataset/
 tensor_logs/
