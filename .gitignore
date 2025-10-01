@@ -3,7 +3,4 @@ checkpoints
 Formers/
 data_provider/
 dataset/
-scripts/*
-scripts/*
-scripts/*
 tensor_logs/
