@@ -235,7 +235,7 @@ class MoE(nn.Module):
         return output
 
 class MoETSAEncoderLayer(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, num_experts, dropout=0.1):
+    def __init__(self, d_model, n_heads, d_ff, num_experts, dropout=0.2):
         super().__init__()
         # self.self_attn = TSA(d_model, n_heads, dropout=dropout)
         self.self_attn = ContextualCouplingTSA(d_model, n_heads, dropout=dropout)
@@ -245,12 +245,13 @@ class MoETSAEncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, src, attn_mask=None):
-        src2, attn_weights = self.self_attn(src, attn_mask=attn_mask)
+        norm_src = self.norm1(src)
+        src2, attn_weights = self.self_attn(norm_src, attn_mask=attn_mask)
         src = src + self.dropout(src2)
-        src = self.norm1(src)
-        src2 = self.moe_ffn(src)
+
+        norm_src = self.norm2(src)
+        src2 = self.moe_ffn(norm_src)
         src = src + self.dropout(src2)
-        src = self.norm2(src)
         return src, attn_weights
 
 class ContextEncoder(nn.Module):

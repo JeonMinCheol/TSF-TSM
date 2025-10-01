@@ -169,13 +169,13 @@ class Exp_Main(Exp_Basic):
         # --- 💡 텐서보드 어텐션 시각화 로깅 (vali 루프 끝난 후) ---
         # 검증 데이터로더에서 첫 번째 배치만 가져와서 시각화
 
-        if 'TSF_TSM' in self.args.model:
+        if 'TSF_TSM' in self.args.model and False:
             vis_batch_x, _, _, _ = next(iter(vali_loader))
             vis_batch_x = vis_batch_x.float().to(self.device)
 
             # 모델을 통해 어텐션 가중치 추출
             normalized_x, _, _, _ = self.model.adaptive_norm_block.normalize(vis_batch_x)
-            _, all_attention_weights = self.model.encoder(normalized_x, get_attn=True)
+            _, all_attention_weights = self.model(normalized_x, get_attn=True)
 
             # 각 레이어와 헤드별로 히트맵 이미지를 텐서보드에 기록
             for layer_idx, attn_weights in enumerate(all_attention_weights):
@@ -219,13 +219,13 @@ class Exp_Main(Exp_Basic):
             scaler = torch.cuda.amp.GradScaler()
             
         if self.args.model == "TSF_TSM":
-            deter_optim, residual_opitm = model_optim
+            deter_optim, residual_optim = model_optim
             deter_scheduler = lr_scheduler.OneCycleLR(optimizer = deter_optim,
                                             steps_per_epoch = train_steps,
                                             pct_start = self.args.pct_start,
                                             epochs = self.args.train_epochs,
                                             max_lr = self.args.learning_rate)
-            residual_scheduler = lr_scheduler.OneCycleLR(optimizer = residual_opitm,
+            residual_scheduler = lr_scheduler.OneCycleLR(optimizer = residual_optim,
                                             steps_per_epoch = train_steps,
                                             pct_start = self.args.pct_start,
                                             epochs = self.args.train_epochs,
@@ -296,14 +296,14 @@ class Exp_Main(Exp_Basic):
                         with torch.cuda.amp.autocast():
                             # 모델 forward 한 번 호출
                             deter_optim.zero_grad()
-                            residual_opitm.zero_grad()
+                            residual_optim.zero_grad()
 
                             deter_loss, residual_loss = self.model(batch_x, batch_y)
                             total_loss = (1 - self.args.alpha) * deter_loss + self.args.alpha * residual_loss
 
                             scaler.scale(total_loss).backward()
                             scaler.step(deter_optim)
-                            scaler.step(residual_opitm)
+                            scaler.step(residual_optim)
                             scaler.update()
 
                         deter_train_loss.append(deter_loss.item())
@@ -313,28 +313,28 @@ class Exp_Main(Exp_Basic):
                         #     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
                         #         with record_function("model_inference"): # 이 블록에 'model_inference'라는 이름을 붙임
                         #             deter_optim.zero_grad()
-                        #             residual_opitm.zero_grad()
+                        #             residual_optim.zero_grad()
 
                         #             deter_loss, residual_loss = self.model(batch_x, batch_y)
                         #             total_loss = deter_loss + self.args.alpha * residual_loss
 
                         #             total_loss.backward()
                         #             deter_optim.step()
-                        #             residual_opitm.step()
+                        #             residual_optim.step()
 
                         #             deter_train_loss.append(deter_loss.item())
                         #             residual_train_loss.append(residual_loss.item())
 
                         #     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
                         deter_optim.zero_grad()
-                        residual_opitm.zero_grad()
+                        residual_optim.zero_grad()
 
                         deter_loss, residual_loss = self.model(batch_x, batch_y)
                         total_loss = deter_loss + self.args.alpha * residual_loss
 
                         total_loss.backward()
                         deter_optim.step()
-                        residual_opitm.step()
+                        residual_optim.step()
 
                         deter_train_loss.append(deter_loss.item())
                         residual_train_loss.append(residual_loss.item())
@@ -400,11 +400,12 @@ class Exp_Main(Exp_Basic):
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop: 
                 print("Early stopping")
+                break
 
             if self.args.lradj != 'TST':
                 if self.args.model == "TSF_TSM":
                     adjust_learning_rate(deter_optim, deter_scheduler, epoch + 1, self.args, True)
-                    adjust_learning_rate(residual_opitm, residual_scheduler, epoch + 1, self.args, True)
+                    adjust_learning_rate(residual_optim, residual_scheduler, epoch + 1, self.args, True)
                 else:
                     adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, True)
             else:

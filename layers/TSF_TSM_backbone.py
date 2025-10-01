@@ -13,15 +13,16 @@ class MeanPredictionHead(nn.Module):
         self.pred_len = configs.pred_len
         self.enc_in = configs.enc_in
         d_model = configs.d_model
-        
-        # 중간 hidden 레이어의 차원을 설정합니다. d_model의 2배~4배 정도가 일반적입니다.
-        hidden_dim = d_model * 4
+        hidden_dim = d_model * 8
 
         self.head = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
             APGELU(hidden_dim),
             nn.Dropout(configs.dropout),
-            nn.Linear(hidden_dim, self.pred_len * self.enc_in) # 최종 출력
+            nn.Linear(hidden_dim, hidden_dim),
+            APGELU(hidden_dim),
+            nn.Dropout(configs.dropout),
+            nn.Linear(hidden_dim, self.pred_len * self.enc_in)
         )
 
     def forward(self, summary_context):
@@ -71,6 +72,7 @@ class ProbabilisticResidualModel(nn.Module):
         
         # [B, num_windows, C, window_size] -> [B * num_windows, C * window_size]
         y_windows_flat = y_windows.reshape(B * num_windows, -1)
+        y_windows_flat = y_windows_flat + 0.003 * torch.randn_like(y_windows_flat)  # 작은 노이즈 추가
         
         # 4. summary_context를 각 윈도우에 맞게 확장
         # [B, d_model] -> [B, num_windows, d_model] -> [B * num_windows, d_model]
@@ -113,6 +115,6 @@ class ProbabilisticResidualModel(nn.Module):
                 final_samples[:, :, start_idx:end_idx, :] += sample_windows[:, :, i, :, :]
                 counts[:, start_idx:end_idx, :] += 1
             
-            final_samples = final_samples / counts.unsqueeze(0)
+            final_samples = final_samples / counts.unsqueeze(0).clamp(min=1.0)
 
         return final_samples

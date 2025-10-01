@@ -43,6 +43,7 @@ class Model(nn.Module):
 
         # 모멘텀 값 (0.9 ~ 0.999 사이의 값 사용)
         self.momentum = configs.momentum
+        self.ln = nn.LayerNorm(configs.enc_in)  # 배치 정규화를 위한 레이어
 
     def forward(self, x_enc, batch_y):
         y_true = batch_y[:, -self.pred_len:, :]
@@ -60,7 +61,7 @@ class Model(nn.Module):
         
         # --- 안정화된 잔차 학습 (Stabilized Residual Learning) ---
         # A. 정규화된 공간에서의 실제 잔차 계산
-        residuals_norm = normalized_y_true - mean_pred_norm.detach()
+        residuals_norm = self.ln(normalized_y_true - mean_pred_norm.detach())
 
         if self.training:
             # 현재 배치의 잔차 통계치 계산
@@ -71,7 +72,7 @@ class Model(nn.Module):
             self.residual_std = self.momentum * self.residual_std + (1 - self.momentum) * batch_std
 
         scaled_residuals = (residuals_norm - self.residual_mean) / (self.residual_std + 1e-8)
-        clipped_residuals = torch.clamp(scaled_residuals, min=-6.0, max=6.0) # 클리핑 범위를 약간 넓게 설정
+        clipped_residuals = torch.clamp(scaled_residuals, min=-4.0, max=4.0)
         
         # D. 정규화된 잔차를 Normalizing Flow로 학습
         log_prob = self.residual_head(summary_context, y=clipped_residuals)

@@ -35,6 +35,7 @@ class MultiScaleTrendSE(nn.Module):
         num_combined_channels = self.enc_in * len(kernel_sizes)
         self.se_block = SEBlock(num_combined_channels, reduction_ratio=reduction_ratio)
         self.projection = nn.Linear(num_combined_channels, self.enc_in)
+        self.projection_dropout = nn.Dropout(0.1) 
 
         self.context_projection = nn.Linear(num_combined_channels, d_model)
         self.context_pool = nn.AdaptiveAvgPool1d(1)
@@ -47,7 +48,8 @@ class MultiScaleTrendSE(nn.Module):
         norm_context = self.context_projection(pooled_features) # [B, d_model]
         recalibrated_trends = self.se_block(concatenated_trends)
         recalibrated_trends = recalibrated_trends.permute(0, 2, 1)
-        final_trend = self.projection(recalibrated_trends)
+        projected_output = self.projection(recalibrated_trends)
+        final_trend = self.projection_dropout(projected_output)
         detrended_x = x - final_trend
         return detrended_x, final_trend, norm_context
 
@@ -61,8 +63,8 @@ class AdaptiveNormalizationBlock(nn.Module):
         # x shape: [B, L, C]
         # context shape: [B, d_model]
         detrended_x, trend, _ = self.detrender_context_generator(x)
-        means = detrended_x.mean(dim=[0, 1], keepdim=True).detach()
-        stdev = torch.sqrt(torch.var(detrended_x, dim=[0, 1], keepdim=True, unbiased=False) + 1e-5)
+        means = detrended_x.mean(dim=1, keepdim=True).detach()
+        stdev = torch.sqrt(torch.var(detrended_x, dim=1, keepdim=True, unbiased=False) + 1e-5)
         normalized_x = (detrended_x - means) / stdev
 
         # 역정규화를 위해 필요한 모든 값을 반환
@@ -71,7 +73,7 @@ class AdaptiveNormalizationBlock(nn.Module):
     def denormalize(self, y_norm, means, stdev, trend):
         # 1. Instance Normalization을 되돌림
         y_detrended = y_norm * stdev + means
-        
+
         # 2. 제거했던 트렌드를 다시 더함
         final_y = y_detrended + trend
         
