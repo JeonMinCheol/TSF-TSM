@@ -3,189 +3,108 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .TSF_TSM_layers import PatchingEmbedding
 from .SelfAttention_Family import AttentionPool
+from timm.models.layers import DropPath
 import math
 
+# TSF_TSM_experts_blocks.py 파일에 추가
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class ContextualCouplingTSA(nn.Module):
-    """
-    Affine Coupling 구조를 컨텍스트 인코딩에 적용한 TSA.
-    
-    입력의 절반(x1)으로 어텐션 컨텍스트를 만들고, 
-    이를 이용해 다른 절반(x2)을 변형시킬 파라미터(s, t)를 생성합니다.
-    """
-    def __init__(self, d_model, n_heads, dropout=0.1):
+    def __init__(self, d_model, n_heads, dropout=0.1, kernel_size=3, attn_temperature=1.0, s_max=2.0):
         super().__init__()
-        # 아핀 커플링을 위해 d_model은 짝수여야 합니다.
         assert d_model % 2 == 0, "d_model must be an even number."
-        
         self.d_model = d_model
-        self.d_channel = d_model // 2 # 입력을 둘로 나누므로 실제 처리 채널 수는 절반
+        self.d_channel = d_model // 2
         self.n_heads = n_heads
+        assert self.d_channel % n_heads == 0, "d_channel must be divisible by n_heads."
         self.d_head = self.d_channel // n_heads
 
-        # 💡 변경 포인트: Q, K는 d_channel을 기준으로 생성 (V는 사용 안 함)
-        self.query_projection = nn.Linear(self.d_channel, self.d_channel)
-        self.key_projection = nn.Linear(self.d_channel, self.d_channel)
-        
-        # Saliency 계산을 위한 Conv1d (입력 채널도 절반)
+        # Q/K/V는 x1 기준 (컨텍스트 생성 전용)
+        self.q_proj = nn.Linear(self.d_channel, self.d_channel)
+        self.k_proj = nn.Linear(self.d_channel, self.d_channel)
+        self.v_proj = nn.Linear(self.d_channel, self.d_channel)
+
+        pad = kernel_size // 2
         self.saliency_conv = nn.Conv1d(
             in_channels=self.d_channel,
             out_channels=n_heads,
-            kernel_size=3,
-            padding='same'
+            kernel_size=kernel_size,
+            padding=pad
         )
+        # saliency 스케일 (학습 가능)
+        self.saliency_alpha = nn.Parameter(torch.tensor(1.0))
 
-        # 💡 핵심 포인트: 어텐션 컨텍스트로부터 scale(s)과 shift(t)를 생성하는 레이어
-        # s와 t 모두 d_channel 크기를 가지므로 출력은 d_channel * 2
-        self.st_projection = nn.Linear(self.d_channel, self.d_channel)
-        
-        # 최종 출력을 위한 선형 레이어 (원본 TSA와 동일)
-        self.out_projection = nn.Linear(d_model, d_model)
-        
+        # 컨텍스트 → (log_scale, shift)
+        self.s_proj = nn.Linear(self.d_channel, self.d_channel)
+        self.t_proj = nn.Linear(self.d_channel, self.d_channel)
+
+        # 최종 출력 투영
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        # 정규화/드롭아웃/파라미터
+        self.pre_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
+        self.attn_temperature = attn_temperature
+        self.s_max = s_max  # log_scale clamp 범위
 
     def forward(self, src, attn_mask=None):
-        # src shape: [B, L, d_model]
-        
-        # 1. 💡 입력을 x1, x2로 분할
-        x1, x2 = src.chunk(2, dim=-1) # [B, L, d_channel]
-        
-        B, L, _ = x1.shape
-
-        # 2. x1을 이용해 Q, K, Saliency 생성 (원본 TSA와 거의 동일)
-        Q = self.query_projection(x1).view(B, L, self.n_heads, self.d_head).transpose(1, 2)
-        K = self.key_projection(x1).view(B, L, self.n_heads, self.d_head).transpose(1, 2)
-        
-        saliency_scores = self.saliency_conv(x1.transpose(1, 2)).unsqueeze(2)
-
-        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
-        attention_scores = attention_scores + saliency_scores
-
-        if attn_mask is not None:
-            attention_scores = attention_scores.masked_fill(attn_mask == 0, -1e9)
-
-        # 3. 💡 어텐션 가중치를 이용해 컨텍스트 벡터 생성 (V 대신 K 사용)
-        # 인코더이므로 softmax를 사용하여 가중치를 만드는 것이 자연스럽습니다.
-        attention_weights = F.softmax(attention_scores, dim=-1)
-        attention_weights = self.dropout(attention_weights)
-        
-        # K를 가중합하여 컨텍스트 벡터를 만듭니다.
-        context = torch.matmul(attention_weights, K) # [B, n_heads, L, d_head]
-        context = context.transpose(1, 2).contiguous().view(B, L, self.d_channel)
-
-        # 4. 💡 컨텍스트 벡터로부터 게이트 파라미터 예측
-        g_params = self.st_projection(context) 
-        gate = torch.sigmoid(g_params)
-        
-        # 5. x2에 게이트 변환 적용
-        transformed_x2 = torch.tanh(x2) 
-        y2 = gate * transformed_x2 + (1 - gate) * x2
-
-        # 6. 💡 변환되지 않은 x1과 변환된 y2를 합치고 최종 출력
-        output = torch.cat([x1, y2], dim=-1) # [B, L, d_model]
-        output = self.out_projection(output)
-
-        return output, attention_weights # MoE 레이어와 호환되는 출력 형태
-
-class TSA(nn.Module):
-    """
-    Temporal Saliency Attention (TSA)
-    시계열의 각 시점(패치)별 중요도를 동적으로 학습하여 어텐션 스코어에 반영합니다.
-    """
-    def __init__(self, d_model, n_heads, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.d_head = d_model // n_heads
-
-        # Q, K, V를 위한 선형 레이어
-        self.query_projection = nn.Linear(d_model, d_model)
-        self.key_projection = nn.Linear(d_model, d_model)
-        self.value_projection = nn.Linear(d_model, d_model)
-        
-        # 최종 출력을 위한 선형 레이어
-        self.out_projection = nn.Linear(d_model, d_model)
-        
-        # 시간적 중요도(Saliency)를 학습하기 위한 1D Conv 레이어
-        self.saliency_conv = nn.Conv1d(
-            in_channels=d_model, 
-            out_channels=n_heads, # 각 헤드별로 다른 saliency를 학습
-            kernel_size=3, 
-            padding='same'
-        )
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, src, attn_mask=None):
-        # src shape: [Batch, Seq_Len, d_model]
+        """
+        src: [B, L, d_model]
+        반환: output [B, L, d_model], attention_weights [B, n_heads, L, L]
+        """
         B, L, _ = src.shape
 
-        # 1. Q, K, V 생성 및 n_heads로 분할
-        Q = self.query_projection(src).view(B, L, self.n_heads, self.d_head).transpose(1, 2)
-        K = self.key_projection(src).view(B, L, self.n_heads, self.d_head).transpose(1, 2)
-        V = self.value_projection(src).view(B, L, self.n_heads, self.d_head).transpose(1, 2)
-        # Q, K, V shape: [B, n_heads, Seq_Len, d_head]
+        # Pre-Norm은 레이어 외부 residual과 잘 맞음
+        src = self.pre_norm(src)
 
-        # 2. 시간적 중요도(Saliency) 스코어 계산
-        # src: [B, L, C] -> [B, C, L] for Conv1d
-        saliency_scores = self.saliency_conv(src.transpose(1, 2)) # -> [B, n_heads, L]
-        # 어텐션 스코어와 덧셈을 위해 차원 확장: [B, n_heads, 1, L]
-        saliency_scores = saliency_scores.unsqueeze(2)
+        # 채널 절반으로 split
+        x1, x2 = src.chunk(2, dim=-1)  # [B, L, d_channel] x 2
 
-        # 3. 어텐션 스코어 계산 및 Saliency 반영
-        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
-        
-        # 💡 핵심: Softmax 이전에 Saliency 스코어를 더해줌
-        # Saliency 스코어가 브로드캐스팅되어 모든 Query에 대한 Key의 중요도로 더해짐
-        attention_scores = attention_scores + saliency_scores
+        # Q/K/V 생성 (x1 기반)
+        Q = self.q_proj(x1).view(B, L, self.n_heads, self.d_head).transpose(1, 2)  # [B,h,L,dh]
+        K = self.k_proj(x1).view(B, L, self.n_heads, self.d_head).transpose(1, 2)
+        V = self.v_proj(x1).view(B, L, self.n_heads, self.d_head).transpose(1, 2)
+
+        # Saliency scores: [B, n_heads, L] → [B, n_heads, 1, L] (모든 Query에 공통 bias)
+        saliency_scores = self.saliency_conv(x1.transpose(1, 2))  # [B, h, L]
+        saliency_scores = saliency_scores.unsqueeze(2)            # [B, h, 1, L]
+
+        # Attention
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
+        # temperature & saliency
+        attn_scores = attn_scores / max(self.attn_temperature, 1e-6)
+        attn_scores = attn_scores + self.saliency_alpha * saliency_scores
 
         if attn_mask is not None:
-            attention_scores = attention_scores.masked_fill(attn_mask == 0, -1e9)
+            attn_scores = attn_scores.masked_fill(attn_mask == 0, float("-inf"))
 
-        # 4. 어텐션 가중치 계산 및 V와 결합
-        attention_weights = F.softmax(attention_scores, dim=-1)
-        attention_weights = self.dropout(attention_weights)
-        
-        output = torch.matmul(attention_weights, V) # [B, n_heads, L, d_head]
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
 
-        # 5. 헤드들을 다시 합치고 최종 출력
-        output = output.transpose(1, 2).contiguous().view(B, L, self.d_model)
-        output = self.out_projection(output)
+        # 컨텍스트: V에 대한 가중합
+        context = torch.matmul(attn_weights, V)  # [B, h, L, dh]
+        context = context.transpose(1, 2).contiguous().view(B, L, self.d_channel)  # [B, L, d_channel]
 
-        return output, attention_weights # 어텐션 가중치도 반환하여 분석에 활용 가능    
+        # Affine 파라미터
+        # log_scale은 clamp로 안정화 → scale = exp(log_scale)
+        log_scale = self.s_proj(context)
+        log_scale = torch.clamp(log_scale, min=-self.s_max, max=self.s_max)
+        shift = self.t_proj(context)
 
-class APGELU(nn.Module):
-    """
-    Adaptive Phase GELU (AP-GELU) - 수정된 버전
-    - 2D 입력 [Tokens, Features]를 처리하도록 수정
-    """
-    def __init__(self, feature_dim): # d_model 대신 feature_dim으로 이름 변경
-        super().__init__()
-        self.omega_head = nn.Linear(feature_dim, feature_dim)
-        self.phi_head = nn.Linear(feature_dim, feature_dim)
+        scale = torch.exp(log_scale)  # [B, L, d_channel]
 
-        nn.init.constant_(self.omega_head.weight, 0)
-        nn.init.constant_(self.omega_head.bias, 1)
-        nn.init.constant_(self.phi_head.weight, 0)
-        nn.init.constant_(self.phi_head.bias, 0)
+        # y2 = scale * x2 + shift
+        y2 = scale * x2 + shift
 
-    def forward(self, x):
-        # x shape: [Tokens, Features] (예: [4967, 256])
-        
-        # 💡 핵심: 토큰 차원(dim=0)에 대해 평균을 내어 통계치 계산
-        # 이렇게 하면 현재 전문가에게 들어온 모든 토큰들의 평균적 특성을 반영
-        if x.dim() < 2 or x.shape[0] <= 1: # 토큰이 하나이거나 없을 경우
-             return F.gelu(x)
+        # concat & project
+        out = torch.cat([x1, y2], dim=-1)  # [B, L, d_model]
+        out = self.out_proj(out)
+        out = self.dropout(out)
 
-        token_stats = x.mean(dim=0) # -> [Features]
-
-        # 통계치를 기반으로 omega와 phi 예측
-        omega = F.softplus(self.omega_head(token_stats)) # -> [Features]
-        phi = self.phi_head(token_stats) # -> [Features]
-        
-        # omega와 phi가 [Features] 형태이므로 [Tokens, Features] 형태인 x에 브로드캐스팅되어 연산됨
-        transformed_x = omega * x + phi
-        
-        return F.gelu(transformed_x)
+        return out, attn_weights
 
 class MoE(nn.Module):
     """Mixture of Experts FFN 레이어."""
@@ -196,7 +115,6 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_model, d_ff),
-                APGELU(d_ff),
                 nn.Linear(d_ff, d_model)
             ) for _ in range(num_experts)
         ])
@@ -235,23 +153,23 @@ class MoE(nn.Module):
         return output
 
 class MoETSAEncoderLayer(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, num_experts, dropout=0.2):
+    def __init__(self, d_model, n_heads, d_ff, num_experts, dropout=0.1):
         super().__init__()
-        # self.self_attn = TSA(d_model, n_heads, dropout=dropout)
         self.self_attn = ContextualCouplingTSA(d_model, n_heads, dropout=dropout)
         self.moe_ffn = MoE(d_model, d_ff, num_experts)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
+        self.drop_path = DropPath(0.1)
 
     def forward(self, src, attn_mask=None):
         norm_src = self.norm1(src)
         src2, attn_weights = self.self_attn(norm_src, attn_mask=attn_mask)
-        src = src + self.dropout(src2)
+        src = src + self.drop_path(self.dropout(src2))
 
         norm_src = self.norm2(src)
         src2 = self.moe_ffn(norm_src)
-        src = src + self.dropout(src2)
+        src = src + self.drop_path(self.dropout(src2))
         return src, attn_weights
 
 class ContextEncoder(nn.Module):

@@ -1,28 +1,22 @@
 import torch
+import math
 import torch.nn as nn
 from .TSF_TSM_layers import *
-from .TSF_TSM_experts_blocks import APGELU
 import logging
 
 class MeanPredictionHead(nn.Module):
-    """
-    메모리 효율적인 MLP 기반의 결정론적 예측 헤드.
-    """
     def __init__(self, configs):
         super().__init__()
         self.pred_len = configs.pred_len
         self.enc_in = configs.enc_in
         d_model = configs.d_model
-        hidden_dim = d_model * 8
+        d_ff = configs.d_ff
 
         self.head = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            APGELU(hidden_dim),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_ff),
             nn.Dropout(configs.dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            APGELU(hidden_dim),
-            nn.Dropout(configs.dropout),
-            nn.Linear(hidden_dim, self.pred_len * self.enc_in)
+            nn.Linear(d_ff, self.pred_len * self.enc_in)
         )
 
     def forward(self, summary_context):
@@ -40,7 +34,7 @@ class ProbabilisticResidualModel(nn.Module):
         self.pred_len = configs.pred_len
         context_dim = configs.d_model
         
-        self.window_size = configs.moving_avg
+        self.window_size = configs.patch_len
         self.stride = configs.stride
 
         feature_dim = self.c_in * self.window_size
@@ -72,7 +66,6 @@ class ProbabilisticResidualModel(nn.Module):
         
         # [B, num_windows, C, window_size] -> [B * num_windows, C * window_size]
         y_windows_flat = y_windows.reshape(B * num_windows, -1)
-        y_windows_flat = y_windows_flat + 0.003 * torch.randn_like(y_windows_flat)  # 작은 노이즈 추가
         
         # 4. summary_context를 각 윈도우에 맞게 확장
         # [B, d_model] -> [B, num_windows, d_model] -> [B * num_windows, d_model]
@@ -83,11 +76,11 @@ class ProbabilisticResidualModel(nn.Module):
         log_prob_windows = self.flow_head.log_prob(y_windows_flat, context=expanded_context)
         
         # 6. 전체 평균 Loss 계산
-        total_log_prob = log_prob_windows.mean()
+        nll_loss = -log_prob_windows.mean()
         
-        return total_log_prob
+        return nll_loss
 
-    def sample(self, summary_context, num_samples=1):
+    def sample(self, summary_context, num_samples=5):
         self.eval()
         with torch.no_grad():
             B = summary_context.size(0)
@@ -118,3 +111,54 @@ class ProbabilisticResidualModel(nn.Module):
             final_samples = final_samples / counts.unsqueeze(0).clamp(min=1.0)
 
         return final_samples
+
+class GaussianResidualModel(nn.Module):
+    def __init__(self, configs):
+        super().__init__()
+        d_model = configs.d_model
+        c_in = configs.enc_in
+
+        # context → [mean, log_var]
+        self.fc = nn.Linear(d_model, 2 * c_in)
+
+    def forward(self, context, y=None):
+        params = self.fc(context)  # [B, 2*C]
+        mean, log_var = params.chunk(2, dim=-1)
+
+        # 분산 범위 확장
+        log_var = torch.clamp(log_var, min=-10.0, max=5.0)
+        std = torch.exp(0.5 * log_var)
+
+        if y is not None:
+            B, L, C = y.shape
+            mean = mean.unsqueeze(1).expand(B, L, C)
+            std = std.unsqueeze(1).expand(B, L, C)
+            log_var = log_var.unsqueeze(1).expand(B, L, C)
+
+            # Gaussian NLL (안정화 버전)
+            nll = 0.5 * (
+                torch.clamp(log_var, min=-10.0, max=10.0) +
+                ((y - mean) ** 2) / (torch.clamp(std**2, min=1e-6)) +
+                math.log(2 * math.pi)
+            )
+            return nll.mean()
+        else:
+            return mean, std
+
+    def sample(self, context, num_samples=1, length=1):
+        """
+        context: [B, d_model]
+        return: [num_samples, B, length, C]
+        """
+        params = self.fc(context)
+        mean, log_var = params.chunk(2, dim=-1)
+        # log_var = torch.clamp(log_var, min=-5.0, max=2.0)
+        std = torch.exp(0.5 * log_var)
+
+        B, C = mean.shape
+        mean = mean.unsqueeze(1).unsqueeze(0).expand(num_samples, B, length, C)
+        std = std.unsqueeze(1).unsqueeze(0).expand(num_samples, B, length, C)
+
+        eps = torch.randn_like(std)
+        samples = mean + eps * std
+        return samples

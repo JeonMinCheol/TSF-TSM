@@ -24,3 +24,17 @@ class ProbMask():
     @property
     def mask(self):
         return self._mask
+
+def random_segment_mask(x, mask_ratio=0.1):
+    """
+    Random Segment Masking
+    x: [B, L, C]
+    mask_ratio: 전체 길이 L 중 몇 %를 랜덤하게 가릴지
+    """
+    B, L, C = x.shape
+    mask_len = max(1, int(L * mask_ratio))
+    start = torch.randint(0, L - mask_len + 1, (1,)).item()
+    
+    x_masked = x.clone()
+    x_masked[:, start:start+mask_len, :] = 0.0
+    return x_masked

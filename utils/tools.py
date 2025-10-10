@@ -1,9 +1,11 @@
 import numpy as np
 import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import csv, os
 import seaborn as sns
+import torch.distributed as dist
 
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
@@ -45,48 +47,64 @@ def adjust_learning_rate(optimizer, scheduler, epoch, args, printout=True):
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
-        print('Updating learning rate to {}'.format(lr))
-
+        if printout:
+            print('Updating learning rate to {}'.format(lr))
 
 class EarlyStopping:
-    def __init__(self, patience=7, verbose=False, delta=0, rank=0):
+    def __init__(self, patience=7, verbose=True, delta=0):
         self.patience = patience
         self.verbose = verbose
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.Inf
+        self.val_loss_min = float("inf")
         self.delta = delta
 
     def __call__(self, val_loss, model, path):
-        score = -val_loss
-        if self.best_score is None:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model, path)
-        elif score < self.best_score + self.delta:
+        if not dist.is_initialized():
+            # Single GPU fallback
+            return self._update(val_loss, model, path)
+
+        # 1) 모든 프로세스의 val_loss 모으기
+        device = next(model.parameters()).device
+        tensor_loss = torch.tensor([val_loss], dtype=torch.float32, device=device)
+        all_losses = [torch.zeros_like(tensor_loss) for _ in range(dist.get_world_size())]
+        dist.all_gather(all_losses, tensor_loss)
+        all_losses = [t.item() for t in all_losses]
+
+        # 2) 현재 스텝에서 가장 낮은 val_loss 가진 rank 찾기
+        best_rank = min(range(len(all_losses)), key=lambda r: all_losses[r])
+        best_val_loss = all_losses[best_rank]
+
+        # 3) 기존 best_loss보다 더 좋아야만 저장
+        if best_val_loss + self.delta < self.val_loss_min:
+            if dist.get_rank() == best_rank:
+                self.save_checkpoint(best_val_loss, model, path, best_rank)
+            self.val_loss_min = best_val_loss
+            self.counter = 0
+        else:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-        else:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model, path)
-            self.counter = 0
 
-    def save_checkpoint(self, val_loss, model, path):
+        # 4) early_stop 상태 동기화
+        flag = torch.tensor(1 if self.early_stop else 0, device=device)
+        dist.broadcast(flag, src=best_rank)
+        self.early_stop = flag.item() == 1
+
+    def save_checkpoint(self, val_loss, model, path, rank):
         if self.verbose:
-            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
-        
+            print(f"[Rank {rank}] Validation loss decreased "
+                  f"({self.val_loss_min:.6f} → {val_loss:.6f}). Saving model ...")
         os.makedirs(path, exist_ok=True)
-        torch.save(model.state_dict(), path + '/' + 'checkpoint.pth')
-        self.val_loss_min = val_loss
-
+        state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+        torch.save(state_dict, os.path.join(path, f"checkpoint.pth"))
 
 class dotdict(dict):
     """dot.notation access to dictionary attributes"""
     __getattr__ = dict.get
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
-
 
 class StandardScaler():
     def __init__(self, mean, std):
@@ -204,7 +222,7 @@ def plot_attention_heatmap(attention_weights, layer_num, head_num, title, sample
     plt.title(f'Attention Heatmap (Layer {layer_num+1}, Head {head_num+1})')
     plt.xlabel('Key (Attended Patches)')
     plt.ylabel('Query (Current Patches)')
-    plt.savefig()
+    plt.savefig(title, bbox_inches='tight', dpi=300)
 
 
 import io
@@ -251,3 +269,22 @@ def get_heatmap_image_tensor(attention_weights, sample_num=0, head_num=0):
     buf.close()
 
     return img_tensor
+
+
+def log_layer_stats(writer, model, step, optimizer, prefix="stats"):
+    for name, p in model.named_parameters():
+        if not p.requires_grad: 
+            continue
+        w = p.data
+        g = p.grad
+        writer.add_scalar(f"weight_{prefix}/{name}_w_mean", w.mean().item(), step)
+        writer.add_scalar(f"weight_{prefix}/{name}_w_std", w.std().item(), step)
+        if g is None:
+            writer.add_scalar(f"grad_{prefix}/{name}_norm", 0.0, step)
+        else:
+            writer.add_scalar(f"grad_{prefix}/{name}_norm", g.norm().item(), step)
+
+        if p.grad is not None:
+            update = -optimizer.param_groups[0]['lr'] * p.grad
+            rel_update = (update.abs().mean() / (p.data.abs().mean() + 1e-8)).item()
+            writer.add_scalar(f"update_ratio/{name}", rel_update, step)

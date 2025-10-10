@@ -62,19 +62,18 @@ class AdaptiveNormalizationBlock(nn.Module):
     def normalize(self, x):
         # x shape: [B, L, C]
         # context shape: [B, d_model]
-        detrended_x, trend, _ = self.detrender_context_generator(x)
+        detrended_x, trend, norm_context = self.detrender_context_generator(x)
         means = detrended_x.mean(dim=1, keepdim=True).detach()
-        stdev = torch.sqrt(torch.var(detrended_x, dim=1, keepdim=True, unbiased=False) + 1e-5)
+        stdev = torch.sqrt(torch.var(detrended_x, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
         normalized_x = (detrended_x - means) / stdev
 
         # 역정규화를 위해 필요한 모든 값을 반환
-        return normalized_x, means, stdev, trend
+        return normalized_x, means, stdev, trend, norm_context
 
     def denormalize(self, y_norm, means, stdev, trend):
-        # 1. Instance Normalization을 되돌림
         y_detrended = y_norm * stdev + means
 
         # 2. 제거했던 트렌드를 다시 더함
-        final_y = y_detrended + trend
+        final_y = y_detrended + trend[:, -y_detrended.size(1):, :]
         
         return final_y

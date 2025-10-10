@@ -1,5 +1,6 @@
 import os
 import torch
+import numpy as np
 
 class Exp_Basic(object):
     def __init__(self, args):
@@ -8,7 +9,7 @@ class Exp_Basic(object):
         self.rank = int(os.environ.get("RANK", 0)) if self.args.use_multi_gpu and self.args.use_gpu else 0
         self.device = self._acquire_device()
         self.model = self._build_model().to(self.device)
-
+    
     def _build_model(self):
         raise NotImplementedError
         return None

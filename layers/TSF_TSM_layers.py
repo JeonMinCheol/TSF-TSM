@@ -31,7 +31,12 @@ def create_conditional_nsf_flow(feature_dim, context_dim, num_layers=5, hidden_f
                     num_blocks=2,
                     activation=F.leaky_relu,
                 ),
-                num_bins=num_bins, tails="linear", tail_bound=5.0
+                num_bins=num_bins, 
+                tails="linear", 
+                tail_bound=3.0, 
+                min_bin_width=1e-3,
+                min_bin_height=1e-3,
+                min_derivative=1e-3,
             )
         )
         transforms.append(BatchNorm(features=feature_dim))
@@ -41,36 +46,35 @@ def create_conditional_nsf_flow(feature_dim, context_dim, num_layers=5, hidden_f
         distribution=StandardNormal([feature_dim])
     )
 
-
 class PatchingEmbedding(nn.Module):
     def __init__(self, patch_len, stride, c_in, d_model):
         super().__init__()
         self.patch_len = patch_len
         self.stride = stride
-        # 💡 각 변수(c_in)를 d_model로 독립적으로 투영합니다.
-        self.projection = nn.Linear(patch_len, d_model)
-        self.layer_norm = nn.LayerNorm(d_model) # 안정성을 위해 추가
-        # 💡 d_model * c_in 차원을 최종 d_model로 다시 투영할 레이어
-        self.final_projection = nn.Linear(d_model * c_in, d_model)
+        
+        # ✅ [변경] 패치 내의 모든 변수와 시점을 한번에 d_model로 투영합니다.
+        # 입력 차원: 변수 개수(c_in) * 패치 길이(patch_len)
+        self.projection = nn.Linear(c_in * patch_len, d_model)
+        # LayerNorm은 안정적인 학습을 위해 유지하는 것이 좋습니다.
+        self.layer_norm = nn.LayerNorm(d_model)
 
     def forward(self, x):
-        # x shape: [B, L, C] (C = c_in)
-        B, L, C = x.shape
-
-        # 1. 패치 생성
+        # x shape: [Batch, Seq_Len, C]
+        
+        # 1. 패치 생성 (PyTorch의 unfold 함수 사용)
+        # 결과 shape: [B, C, Num_Patches, Patch_Len]
         x_unfolded = x.permute(0, 2, 1).unfold(dimension=-1, size=self.patch_len, step=self.stride)
-        x_patched = x_unfolded.permute(0, 2, 1, 3) # [B, Num_Patches, C, Patch_Len]
-        B, n_patches, C, P = x_patched.shape
-
-        # 2. 💡 각 변수별로 독립적인 임베딩 수행
-        # [B, n_patches, C, P] -> [B * n_patches * C, P]
-        x_patched_flat = x_patched.reshape(-1, P)
-        projected = self.projection(x_patched_flat) # [B * n_patches * C, d_model]
-
-        # 3. 💡 변수들의 임베딩을 합치고 최종 차원으로 투영
-        projected = projected.reshape(B, n_patches, C, -1) # [B, n_patches, C, d_model]
-        projected_flat = projected.reshape(B, n_patches, -1) # [B, n_patches, C * d_model]
-
-        out = self.final_projection(projected_flat) # [B, n_patches, d_model]
-
+        
+        # 2. ✅ [변경] 패치를 flatten하여 한번에 투영
+        # [B, C, Num_Patches, Patch_Len] -> [B, Num_Patches, C, Patch_Len]
+        x_patched = x_unfolded.permute(0, 2, 1, 3)
+        
+        # [B, Num_Patches, C, Patch_Len] -> [B, Num_Patches, C * Patch_Len]
+        # 각 패치에 있는 모든 값들을 하나의 벡터로 만듭니다.
+        x_patched = x_patched.reshape(x_patched.shape[0], x_patched.shape[1], -1)
+        
+        # [B, Num_Patches, C * Patch_Len] -> [B, Num_Patches, d_model]
+        out = self.projection(x_patched)
+        out = self.layer_norm(out) # LayerNorm 적용
+        
         return out
